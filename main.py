@@ -1,87 +1,130 @@
-# main.py
+# main.py (replace extract_audio_stream only)
 import os
 import asyncio
-import configparser
 import logging
+import tempfile
+from minio import Minio
+import subprocess
+import configparser
 
-# -----------------------
-# Setup logging (errors only)
-# -----------------------
-logging.basicConfig(
-    level=logging.ERROR,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# -----------------------
-# Load config
-# -----------------------
 cfg = configparser.ConfigParser()
 cfg.read("config.cfg")
 
+MINIO_HOST = cfg.get("minio", "host") + ':' + cfg.get("minio", "port")
+MINIO_ACCESS_KEY = cfg.get("minio", "access_key")
+MINIO_SECRET_KEY = cfg.get("minio", "secret_key")
+MINIO_SECURE = False  # True if using HTTPS
+
 MINIO_DATA_PATH = cfg.get("paths", "minio_data_path")
-DEFAULT_AUDIO_FORMAT = cfg.get("paths", "default_audio_format", fallback="mp3")
-DEFAULT_BUCKET_NAME = cfg.get("paths", "default_bucket_name", fallback="videos")
+
+DEFAULT_AUDIO_FORMAT = "mp3"
 ALLOWED_FORMATS = ["mp3", "wav", "flac"]
 
+minio_client = Minio(
+    MINIO_HOST,
+    access_key=MINIO_ACCESS_KEY,
+    secret_key=MINIO_SECRET_KEY,
+    secure=MINIO_SECURE
+)
 
-async def extract_audio_bytes(bucket_name: str, video_path: str, audio_format: str = DEFAULT_AUDIO_FORMAT) -> bytes:
+async def extract_audio_stream(bucket_name: str, object_name: str, audio_format: str = DEFAULT_AUDIO_FORMAT, chunk_size: int = 64*1024):
     """
-    Extract audio from a video located in MinIO storage.
-    Returns the full audio as bytes (in memory), no disk write.
+    Download video (possibly multiple segments) from MinIO, merge if needed, extract audio with FFmpeg, yield chunks.
     """
     if audio_format not in ALLOWED_FORMATS:
         raise ValueError(f"Invalid audio format '{audio_format}'. Allowed: {ALLOWED_FORMATS}")
 
-    os_video_path = os.path.join(MINIO_DATA_PATH, bucket_name, video_path)
-    print(f"[INFO] Video path resolved: {os_video_path}")
+    # --- Create temp working dir ---
+    temp_dir = tempfile.mkdtemp(prefix="audio_extract_")
+    print(f"[DEBUG] Temporary working dir: {temp_dir}")
 
-    if not os.path.exists(os_video_path):
-        logging.error(f"Video file not found: {video_path}")
-        raise FileNotFoundError(f"Video not found: {video_path}")
+    # --- Collect segments ---
+    segments = [object_name]
+    idx = 2
+    while True:
+        part_name = f"{object_name}.part{idx}"
+        try:
+            minio_client.stat_object(bucket_name, part_name)
+            segments.append(part_name)
+            idx += 1
+        except Exception:
+            break
+    print(f"[DEBUG] Segments to merge: {segments}")
 
-    video_minio_url = f'http://localhost:9001/api/v1/buckets/{bucket_name}/objects/download?prefix={video_path}&version_id=null'
-    print(f'[INFO] Video MINIO URL resolved: {video_minio_url}')
+    segment_files = []
+    # Download all segments
+    for seg in segments:
+        local_path = os.path.join(temp_dir, os.path.basename(seg))
+        minio_client.fget_object(bucket_name, seg, local_path)
+        segment_files.append(local_path)
+        print(f"[DEBUG] Downloaded segment: {local_path}")
 
+    # --- Merge segments if multiple ---
+    if len(segment_files) > 1:
+        concat_file = os.path.join(temp_dir, "concat.txt")
+        with open(concat_file, "w") as f:
+            for fpath in segment_files:
+                f.write(f"file '{fpath}'\n")
+        merged_path = os.path.join(temp_dir, "merged.mp4")
+        ffmpeg_merge_cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_file,
+            "-c", "copy",
+            merged_path
+        ]
+        print(f"[DEBUG] Running FFmpeg merge: {' '.join(ffmpeg_merge_cmd)}")
+        result = subprocess.run(ffmpeg_merge_cmd, capture_output=True)
+        if result.returncode != 0:
+            print(f"[ERROR] FFmpeg merge failed: {result.stderr.decode()}")
+            raise Exception(f"FFmpeg merge failed: {result.stderr.decode()}")
+        video_path = merged_path
+        print(f"[INFO] Segments merged successfully: {video_path}")
+    else:
+        video_path = segment_files[0]
 
-    # FFmpeg codec mapping
-    codec_map = {
-        "mp3": "libmp3lame",
-        "wav": "pcm_s16le",
-        "flac": "flac"
-    }
+    # --- Extract audio and stream ---
+    codec_map = {"mp3": "libmp3lame", "wav": "pcm_s16le", "flac": "flac"}
     codec = codec_map[audio_format]
 
-    cmd = [
+    ffmpeg_stream_cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
-        "-i", video_minio_url,
+        "-i", video_path,
         "-vn",
         "-acodec", codec,
         "-f", audio_format,
-        "pipe:1"  # output to stdout
+        "pipe:1"
     ]
+    print(f"[DEBUG] Running FFmpeg stream: {' '.join(ffmpeg_stream_cmd)}")
 
-    print("[INFO] Running FFmpeg to extract full audio into memory...")
     process = await asyncio.create_subprocess_exec(
-        *cmd,
+        *ffmpeg_stream_cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
 
-    audio_bytes = bytearray()
-    chunk_size = 8 * 1024 * 1024  # 4 MB
-    while True:
-        chunk = await process.stdout.read(chunk_size)
-        if not chunk:
-            break
-        audio_bytes.extend(chunk)
+    try:
+        while True:
+            chunk = await process.stdout.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
 
-    _, stderr = await process.communicate()
-    if process.returncode != 0:
-        logging.error(f"FFmpeg error: {stderr.decode()}")
-        raise Exception(f"FFmpeg failed: {stderr.decode()}")
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            print(f"[ERROR] FFmpeg stream error: {stderr.decode()}")
+            raise Exception(f"FFmpeg failed: {stderr.decode()}")
 
-    print(f"[INFO] Audio extraction complete, size: {len(audio_bytes) / (1024*1024):.2f} MB")
-    return bytes(audio_bytes)
-
+    finally:
+        # Clean up everything
+        for fpath in segment_files:
+            if os.path.exists(fpath):
+                os.remove(fpath)
+        if os.path.exists(video_path) and video_path not in segment_files:
+            os.remove(video_path)
+        os.rmdir(temp_dir)
+        print(f"[DEBUG] Cleaned up temporary files: {temp_dir}")

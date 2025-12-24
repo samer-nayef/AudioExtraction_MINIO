@@ -1,12 +1,10 @@
 # api.py
 import json
-import os
-import asyncio
 import configparser
 import logging
 import tornado.ioloop
 import tornado.web
-from main import extract_audio_bytes, DEFAULT_AUDIO_FORMAT, DEFAULT_BUCKET_NAME, ALLOWED_FORMATS
+from main import extract_audio_stream
 
 # -----------------------
 # Setup logging (errors only)
@@ -25,6 +23,11 @@ cfg.read("config.cfg")
 HOST = cfg.get("server", "host")
 PORT = cfg.getint("server", "port")
 
+MINIO_DATA_PATH = cfg.get("paths", "minio_data_path")
+DEFAULT_AUDIO_FORMAT = cfg.get("paths", "default_audio_format", fallback="mp3")
+DEFAULT_BUCKET_NAME = cfg.get("paths", "default_bucket_name", fallback="videos")
+ALLOWED_FORMATS = ["mp3", "wav", "flac"]
+
 
 class ExtractAudioHandler(tornado.web.RequestHandler):
     async def post(self):
@@ -34,25 +37,21 @@ class ExtractAudioHandler(tornado.web.RequestHandler):
             audio_format = body.get("audio_format", DEFAULT_AUDIO_FORMAT)
             bucket_name = body.get("bucket_name", DEFAULT_BUCKET_NAME)
 
-            print(f"[INFO] Extracting {audio_format} audio from bucket '{bucket_name}' video '{video_path}'")
+            print(f"[INFO] Request received for bucket '{bucket_name}', video '{video_path}' with format '{audio_format}'")
 
             if audio_format not in ALLOWED_FORMATS:
                 raise ValueError(f"Invalid audio format '{audio_format}'. Allowed: {ALLOWED_FORMATS}")
-
-            # Extract audio fully into memory
-            audio_bytes = await extract_audio_bytes(bucket_name, video_path, audio_format)
-
-            print(f"[INFO] Sending audio back, size: {len(audio_bytes)/(1024*1024):.2f} MB")
 
             self.set_header("Content-Type",
                             "audio/mpeg" if audio_format == "mp3" else f"audio/{audio_format}")
             self.set_header("Content-Disposition", f'attachment; filename="extracted.{audio_format}"')
 
-            # Stream the audio bytes in 4 MB chunks
-            chunk_size = 8 * 1024 * 1024
-            for i in range(0, len(audio_bytes), chunk_size):
-                self.write(audio_bytes[i:i+chunk_size])
+            # Stream audio in chunks directly from FFmpeg
+            async for chunk in extract_audio_stream(bucket_name, video_path, audio_format):
+                self.write(chunk)
                 await self.flush()
+
+            print("[INFO] Audio stream finished sending")
 
         except FileNotFoundError as e:
             logging.error(str(e))
